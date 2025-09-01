@@ -1,6 +1,8 @@
 import pandas as pd
-import yfinance as yf
 import psycopg2
+from psycopg2.extras import execute_values
+import json
+from io import StringIO
 
 DB_CONN= {
     "dbname": "airflow",
@@ -11,48 +13,45 @@ DB_CONN= {
 }
 
 def extract_data(ti):
-    data = {}
-    for stock in STOCKS:
-        df = yf.download(stock, period="1d", interval="1h")
-        data[stock] = df.reset_index().to_json()
-    ti.xcom_push(key="raw_data", value=data)
+    df = pd.read_csv("data/amazon.csv")
+    print(df.head())
+    ti.xcom_push(key="extracted_data", value=df.to_json())
+    return df
 
 def transform_data(ti):
-    raw_data = ti.xcom_pull(key="raw_data", task_ids="extract_stock_data")
-    transformed = {}
-    for stock, raw_json in raw_data.items():
-        df = pd.read_json(raw_json)
-        df["SMA_5"] = df["Close"].rolling(5).mean()
-        transformed[stock] = df.to_json()
-    ti.xcom_push(key="transformed_data", value=transformed)
+    raw_data = ti.xcom_pull(key="extracted_data", task_ids="extract_data")
+    df = pd.read_json(StringIO(raw_data))
+
+    product_count = df.groupby('category')['product_id'].count()
+    product_count_df = product_count.reset_index()
+    product_count_df.columns = ['category', 'product_count']
+
+    ti.xcom_push(key="transformed_data", value=product_count_df.to_json())
+    return product_count_df
 
 def load_to_db(ti):
     transformed_data = ti.xcom_pull(key="transformed_data", task_ids="transform_data")
-    conn = psycopg2.connect(**DB_CONN)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS stock_prices (
-            stock VARCHAR(10),
-            datetime TIMESTAMP,
-            open FLOAT,
-            high FLOAT,
-            low FLOAT,
-            close FLOAT,
-            adj_close FLOAT,
-            volume BIGINT,
-            sma_5 FLOAT
-        );
-    """)
-    for stock, json_data in transformed_data.items():
-        df = pd.read_json(json_data)
-        for _, row in df.iterrows():
+    df = pd.read_json(StringIO(transformed_data))
+
+    # Prepare bulk insert values
+    values = [(row['category'], int(row['product_count'])) for _, row in df.iterrows()]
+
+    with psycopg2.connect(**DB_CONN) as conn:
+        with conn.cursor() as cursor:
             cursor.execute("""
-                INSERT INTO stock_prices (stock, datetime, open, high, low, close, adj_close, volume, sma_5)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """, (
-                stock, row["Datetime"], row["Open"], row["High"], row["Low"],
-                row["Close"], row["Adj Close"], row["Volume"], row["SMA_5"]
-            ))
+                CREATE TABLE IF NOT EXISTS product_category (
+                    id SERIAL PRIMARY KEY,
+                    category VARCHAR(255),
+                    product_count INTEGER,
+                    transformed_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+            # Bulk insert
+            execute_values(cursor, """
+                INSERT INTO product_category (category, product_count)
+                VALUES %s
+            """, values)
     conn.commit()
     cursor.close()
     conn.close()
